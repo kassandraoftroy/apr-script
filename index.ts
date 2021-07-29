@@ -8,59 +8,90 @@ import guniPoolABI from './guniPoolABI'
 import * as dotenv from "dotenv";
 dotenv.config({ path: __dirname + "/.env" });
 
-const computeAPRFromSnapshots = (snapshots: any) => {
-  let cumulativeBlocks = 0
-  let cumulativeGrowth = 0
-  for (let i=1; i<snapshots.length; i++) {
-    const lastSnapshot = snapshots[i-1]
-    const currentSnapshot = snapshots[i]
-    const blockDelta = Number(currentSnapshot.block) - Number(lastSnapshot.block)
-    cumulativeBlocks += blockDelta
-    const lastNumerator = Number(ethers.utils.formatEther(BigNumber.from(lastSnapshot.tickSpan).mul(BigNumber.from(lastSnapshot.liquidity))))
-    const lastValue = lastNumerator/Number(ethers.utils.formatEther(lastSnapshot.totalSupply))
-    const currentNumerator = Number(ethers.utils.formatEther(BigNumber.from(currentSnapshot.tickSpan).mul(BigNumber.from(currentSnapshot.liquidity))))
-    const currentValue = currentNumerator/Number(ethers.utils.formatEther(currentSnapshot.totalSupply))
-    const valueDelta = (currentValue-lastValue)/lastValue
-    cumulativeGrowth += valueDelta * blockDelta
+const X96 = BigNumber.from(2).pow(BigNumber.from(96))
+const BLOCKS_PER_YEAR = 2102400
+
+const computeAverageReserves = (snapshots: any, sqrtPriceX96: BigNumber, firstBlock: number) => {
+  let cumulativeBlocks = BigNumber.from(0)
+  let cumulativeReserves = BigNumber.from(0)
+  const priceX96X96 = sqrtPriceX96.mul(sqrtPriceX96)
+  for (let i=0; i<snapshots.length; i++) {
+    if (Number(snapshots[i].block) > firstBlock) {
+      const reserves0 = BigNumber.from(snapshots[i].reserves0)
+      const reserves1 = BigNumber.from(snapshots[i].reserves1)
+      const reserves0As1X96 = reserves0.mul(priceX96X96).div(X96)
+      const reserves0As1 = reserves0As1X96.div(X96)
+      const reserves = reserves1.add(reserves0As1)
+      let blockDifferential: BigNumber
+      if (i==0) {
+        blockDifferential = BigNumber.from(snapshots[i].block).sub(BigNumber.from(firstBlock.toString()))
+      } else {
+        blockDifferential = BigNumber.from(snapshots[i].block).sub(BigNumber.from(snapshots[i-1].block))
+      }
+      if (blockDifferential.lt(ethers.constants.Zero)) {
+        blockDifferential = ethers.constants.Zero
+      }
+      cumulativeReserves = cumulativeReserves.add(reserves.mul(blockDifferential))
+      cumulativeBlocks = cumulativeBlocks.add(blockDifferential)
+    }
   }
-  let avgGrowth = cumulativeGrowth/cumulativeBlocks
-  let growthPerYear = avgGrowth*2102400/cumulativeBlocks
-  return growthPerYear
+  return cumulativeReserves.div(cumulativeBlocks)
 }
 
-const getAPR = async (poolData: any, helpersContract: any, guniPoolContract: any, uniswapPoolContract: any): Promise<number> => {
+const computeTotalFeesEarned = (snapshots: any, sqrtPriceX96: BigNumber): BigNumber => {
+  let feesEarned0 = BigNumber.from(0)
+  let feesEarned1 = BigNumber.from(0)
+  for (let i=0; i<snapshots.length; i++) {
+    feesEarned0 = feesEarned0.add(BigNumber.from(snapshots[i].feesEarned0))
+    feesEarned1 = feesEarned1.add(BigNumber.from(snapshots[i].feesEarned1))
+  }
+  const priceX96X96 = sqrtPriceX96.mul(sqrtPriceX96)
+  const fees0As1X96 = feesEarned0.mul(priceX96X96).div(X96)
+  const fees0As1 = fees0As1X96.div(X96)
+  return feesEarned1.add(fees0As1)
+}
+
+const getAPR = async (poolData: any, guniPoolContract: any, uniswapPoolContract: any, helpersContract: any, balance0: BigNumber, balance1: BigNumber): Promise<number> => {
   if (poolData.supplySnapshots.length == 0) {
     return 0
   }
-  let snapshots = [...poolData.rebalanceSnapshots].sort((a: any, b:any) => (a.block > b.block) ? 1: -1)
-  let supplySnaps = [...poolData.supplySnapshots].sort((a: any, b: any) => (a.block < b.block) ? 1: -1)
-  let currentBlock = (await helpersContract.provider.getBlock('latest')).number
-  if (snapshots.length == 0) {
-    for (let j=0; j<supplySnaps.length; j++) {
-      if (Number(supplySnaps[j].block) + 5600 < Number(currentBlock.toString())) {
-        snapshots.push(supplySnaps[j])
-        break
-      }
-    }
-  }
-  if (snapshots.length == 0) {
+  if (poolData.feeSnapshots.length == 0) {
     return 0
   }
+  let snapshots = [...poolData.feeSnapshots].sort((a: any, b:any) => (a.block > b.block) ? 1: -1)
+  let supplySnaps = [...poolData.supplySnapshots].sort((a: any, b: any) => (a.block > b.block) ? 1: -1)
+  let currentBlock = (await helpersContract.provider.getBlock('latest')).number
   const sqrtPriceX96 = (await uniswapPoolContract.slot0()).sqrtPriceX96
-  const gross = await guniPoolContract.getUnderlyingBalances()
-  const liquidity = await helpersContract.getLiquidityForAmounts(sqrtPriceX96, poolData.lowerTick, poolData.upperTick, gross[0], gross[1])
-  const tickSpan = Number(poolData.upperTick) - Number(poolData.lowerTick)
+  const {amount0Current, amount1Current} = await guniPoolContract.getUnderlyingBalances()
+  const positionId = await guniPoolContract.getPositionID()
+  const {_liquidity} = await uniswapPoolContract.positions(positionId)
+  const {amount0, amount1} = await helpersContract.getAmountsForLiquidity(sqrtPriceX96, poolData.lowerTick, poolData.upperTick, _liquidity)
+  let feesEarned0 = amount0Current.sub(amount0).sub(balance0)
+  let feesEarned1 = amount1Current.sub(amount1).sub(balance1)
+  if (feesEarned0.lt(ethers.constants.Zero)) {
+    feesEarned0 = ethers.constants.Zero
+  }
+  if (feesEarned1.lt(ethers.constants.Zero)) {
+    feesEarned1 = ethers.constants.Zero
+  }
   snapshots.push({
     block: currentBlock.toString(),
-    totalSupply: poolData.totalSupply,
-    liquidity: liquidity.toString(),
-    tickSpan: tickSpan.toString()
+    feesEarned0: feesEarned0.toString(),
+    feesEarned1: feesEarned1.toString()
   })
-  return computeAPRFromSnapshots(snapshots)
+  const totalFeeValue = computeTotalFeesEarned(snapshots, sqrtPriceX96)
+  const averageReserves = computeAverageReserves(supplySnaps, sqrtPriceX96, Number(poolData.lastTouchWithoutFees))
+  let averagePrincipal = averageReserves.sub(totalFeeValue)
+  if (averagePrincipal.lt(ethers.constants.Zero)) {
+    averagePrincipal = averageReserves
+  }
+  const totalBlocks = Number(currentBlock.toString()) - Number(poolData.lastTouchWithoutFees)
+  const apr = (Number(ethers.utils.formatEther(totalFeeValue)) * BLOCKS_PER_YEAR) / (Number(ethers.utils.formatEther(averagePrincipal)) * totalBlocks)
+  return apr
 } 
 
 export const fetchAPRs = async () => {
-    const APIURL = "https://api.thegraph.com/subgraphs/name/superarius/guni";
+    const APIURL = "https://api.thegraph.com/subgraphs/name/gelatodigital/g-uni";
     const PROVIDER = new ethers.providers.JsonRpcProvider(`https://eth-mainnet.alchemyapi.io/v2/${process.env.ALCHEMY_ID}`)
     const UNISWAP_HELPERS_ADDRESS = '0xFbd0B8D8016b9f908fC9652895c26C5a4994fE36'
 
@@ -79,19 +110,18 @@ export const fetchAPRs = async () => {
           lowerTick
           upperTick
           totalSupply
+          lastTouchWithoutFees
           supplySnapshots {
             id
-            totalSupply
-            liquidity
             block
-            tickSpan
+            reserves0
+            reserves1
           }
-          rebalanceSnapshots {
+          feeSnapshots {
             id
-            totalSupply
-            liquidity
             block
-            tickSpan
+            feesEarned0
+            feesEarned1
           }
         }
       }
@@ -105,14 +135,16 @@ export const fetchAPRs = async () => {
       query: gql(obsQ)
     })
     const pools = data.data.pools
-    
-    const helpersContract = new ethers.Contract(UNISWAP_HELPERS_ADDRESS, ["function getLiquidityForAmounts(uint160,int24,int24,uint256,uint256) external pure returns(uint128)"], PROVIDER)
-    console.log("fetching pools...")
+    const helpersContract = new ethers.Contract(UNISWAP_HELPERS_ADDRESS, ["function getAmountsForLiquidity(uint160,int24,int24,uint128) external pure returns(uint256 amount0,uint256 amount1)"], PROVIDER)
     for (let i=0; i<pools.length; i++) {
       const guniPoolContract = new ethers.Contract(ethers.utils.getAddress(pools[i].id), guniPoolABI, PROVIDER)
       const uniswapPoolContract = new ethers.Contract(ethers.utils.getAddress(pools[i].uniswapPool), uniswapPoolABI, PROVIDER)
-
-      const apr = await getAPR(pools[i], helpersContract, guniPoolContract, uniswapPoolContract)
+      const token0 = new ethers.Contract(ethers.utils.getAddress(pools[i].token0), ["function balanceOf(address) external view returns (uint256)"], PROVIDER)
+      const token1 = new ethers.Contract(ethers.utils.getAddress(pools[i].token1), ["function balanceOf(address) external view returns (uint256)"], PROVIDER)
+      const balance0 = await token0.balanceOf(ethers.utils.getAddress(pools[i].id))
+      const balance1 = await token1.balanceOf(ethers.utils.getAddress(pools[i].id))
+      console.log(`fetching apr for pool ${pools[i].id.substring(0, 6)}...`)
+      const apr = await getAPR(pools[i], guniPoolContract, uniswapPoolContract, helpersContract, balance0, balance1)
       
       console.log(`pool ${pools[i].id.substring(0, 6)}: ${(100*apr).toFixed(3)}%`)
     }
